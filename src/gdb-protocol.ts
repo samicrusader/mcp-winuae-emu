@@ -484,14 +484,25 @@ export class GdbProtocol {
 
   /**
    * Send a monitor command (qRcmd). Command is hex-encoded in the packet.
-   * WinUAE Bartman GDB server supports: screenshot, disasm, profile, reset, input key/event
-   * Returns hex-encoded response; decode with Buffer.from(hex, 'hex').toString('utf8')
+   *
+   * Supported by this fork's stub: status, memcfg, warp, watch, protect, base,
+   * trace, df<n> insert/eject, input key|event|joy|mouse, screenshot, disasm,
+   * profile, reset. Anything else answers E01 - notably debugperiph, train,
+   * rewind and findproc, which only exist in the upstream author\'s private tree.
+   *
+   * Returns the raw reply. Most commands hex-encode their text (decode with
+   * Buffer.from(hex, 'hex')); `warp` deliberately replies in plain text.
    */
   async sendMonitorCommand(command: string, timeoutMs: number = 60000): Promise<string> {
     const hexCmd = Buffer.from(command, 'utf8').toString('hex');
     const reply = await this.sendCommand(`qRcmd,${hexCmd}`, timeoutMs);
     if (reply.startsWith('E')) {
-      throw new Error(`Monitor command failed: ${reply}`);
+      const verb = command.split(/\s+/)[0];
+      throw new Error(
+        `Monitor command '${verb}' rejected by the WinUAE GDB stub (${reply}). ` +
+        `The stub answers E01 for commands it does not implement; check that this ` +
+        `WinUAE build is new enough to provide '${verb}'. Full command: ${command}`
+      );
     }
     return reply;
   }

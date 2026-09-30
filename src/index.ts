@@ -1049,7 +1049,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_rewind',
-    description: 'Rewind control (experimental). command=start enables WinUAE state capture (input recording in memory); stop disables it; status shows capture state. With no command, rewinds one frame — NOTE: the restore is fragile with GDB attached and may crash the emulator (pre-existing WinUAE issue); use in disposable sessions only.',
+    description: 'NOT AVAILABLE in this WinUAE build (answers E01): this command only exists in the upstream author\'s private WinUAE-DBG tree and is not implemented by the public BartmanAbyss/axewater stub lineage. Rewind control (experimental). command=start enables WinUAE state capture (input recording in memory); stop disables it; status shows capture state. With no command, rewinds one frame — NOTE: the restore is fragile with GDB attached and may crash the emulator (pre-existing WinUAE issue); use in disposable sessions only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1069,7 +1069,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_side_read',
-    description: 'Read the WinUAE side channel (localhost:2346, independent of GDB). Useful when GDB is unavailable or inert (e.g. after a rewind restore). Commands: state (debugger state, pc, sr, cycles, sections), regs (D0-D7/A0-A7/SR/PC), mem <hex-addr> <len> (hex data), runstatus <hex-addr> (magic/state/frame/detail of a run-status symbol).',
+    description: 'NOT AVAILABLE in this WinUAE build (answers E01): this command only exists in the upstream author\'s private WinUAE-DBG tree and is not implemented by the public BartmanAbyss/axewater stub lineage. Read the WinUAE side channel (localhost:2346, independent of GDB). Useful when GDB is unavailable or inert (e.g. after a rewind restore). Commands: state (debugger state, pc, sr, cycles, sections), regs (D0-D7/A0-A7/SR/PC), mem <hex-addr> <len> (hex data), runstatus <hex-addr> (magic/state/frame/detail of a run-status symbol).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1082,7 +1082,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_debugperiph',
-    description: 'Control/query the debug peripheral mapped at 0xB70000 (e9k-style "Amiga Debug Peripherals"): the emulated program can self-instrument via console output (0xB70000), breakpoint requests (0xB70004), section bases, checkpoints (0xB70020), debug args (0xB7E900..) and a CPU cycle counter (0xB7E928). With no args returns status; `arg <n> <value>` sets a debug arg; `console` shows buffered console text; `checkpoints` dumps recorded checkpoints; `flush` flushes the console.',
+    description: 'NOT AVAILABLE in this WinUAE build (answers E01): this command only exists in the upstream author\'s private WinUAE-DBG tree and is not implemented by the public BartmanAbyss/axewater stub lineage. Control/query the debug peripheral mapped at 0xB70000 (e9k-style "Amiga Debug Peripherals"): the emulated program can self-instrument via console output (0xB70000), breakpoint requests (0xB70004), section bases, checkpoints (0xB70020), debug args (0xB7E900..) and a CPU cycle counter (0xB7E928). With no args returns status; `arg <n> <value>` sets a debug arg; `console` shows buffered console text; `checkpoints` dumps recorded checkpoints; `flush` flushes the console.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1104,7 +1104,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_train',
-    description: 'e9k-style train: break when a write changes a value from <from> to <to> at ANY address (`monitor train`). `ignore` adds the last triggered address to the ignore list; `clear` empties it.',
+    description: 'NOT AVAILABLE in this WinUAE build (answers E01): this command only exists in the upstream author\'s private WinUAE-DBG tree and is not implemented by the public BartmanAbyss/axewater stub lineage. e9k-style train: break when a write changes a value from <from> to <to> at ANY address (`monitor train`). `ignore` adds the last triggered address to the ignore list; `clear` empties it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1647,7 +1647,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_findproc',
-    description: 'Search for a named process in AmigaOS and update baseText for breakpoint relocation. Use after the program has started to fix breakpoint issues when baseText=0. Returns process info or list of current processes if not found.',
+    description: 'NOT AVAILABLE in this WinUAE build (answers E01): this command only exists in the upstream author\'s private WinUAE-DBG tree and is not implemented by the public BartmanAbyss/axewater stub lineage. Search for a named process in AmigaOS and update baseText for breakpoint relocation. Use after the program has started to fix breakpoint issues when baseText=0. Returns process info or list of current processes if not found.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2145,16 +2145,26 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const addr = parseHexOrDecimal(args.address);
         const bytes = Buffer.from(args.data.replace(/[^0-9A-Fa-f]/g, ''), 'hex');
         const protocol = connection.getProtocol();
-        // Many GDB stubs only honour M when halted. Set WINUAE_MEMORY_WRITE_NO_PAUSE=1 to try with CPU running.
-        if (process.env.WINUAE_MEMORY_WRITE_NO_PAUSE !== '1') {
+        // The M handler writes straight through the addrbank, so it does not
+        // need a halted CPU. Pausing by default was expensive (it stalls WinUAE's
+        // Win32 message pump while the stub sits in its halt loop) and left the
+        // emulator stopped without the caller asking. Set WINUAE_MEMORY_WRITE_PAUSE=1
+        // to restore the old halt-first behaviour when a write must be atomic
+        // with respect to the running program.
+        let paused = false;
+        if (process.env.WINUAE_MEMORY_WRITE_PAUSE === '1') {
           try {
             await protocol.pause();
+            paused = true;
           } catch {
-            // Already paused or pause failed; try write anyway
+            // Already paused, or pause failed; write anyway
           }
         }
         await protocol.writeMemory(addr, bytes);
-        return { content: [{ type: 'text', text: `Wrote ${bytes.length} bytes to ${hex32(addr)}. CPU is paused; use winuae_continue to resume.` }] };
+        const note = paused
+          ? ' CPU is paused; use winuae_continue to resume.'
+          : ' CPU left running. To hold a value against the running program, use winuae_protect with action=set.';
+        return { content: [{ type: 'text', text: `Wrote ${bytes.length} bytes to ${hex32(addr)}.${note}` }] };
       }
 
       case 'winuae_memory_dump': {
