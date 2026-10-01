@@ -41,6 +41,8 @@ export class WinUAEConnection {
   private isConnected = false;
   private logFilePath: string | null = null;
   private floppies: Map<number, string> = new Map();
+  // How the last launch attached, so restart() comes back the same way.
+  private lastConnectBehavior: WinUAEConnectBehavior = {};
   private sessionIdleTimeoutMs = Math.max(0, parseInt(process.env.WINUAE_SESSION_IDLE_TIMEOUT_MS || '0', 10));
   private sessionIdleAction: SessionIdleAction =
     process.env.WINUAE_SESSION_IDLE_ACTION === 'shutdown' ? 'shutdown' : 'detach';
@@ -90,6 +92,7 @@ export class WinUAEConnection {
    * 3. Retry-connect to TCP port 2345
    */
   async connect(connectBehavior: WinUAEConnectBehavior = {}): Promise<void> {
+    this.lastConnectBehavior = connectBehavior;
     if (this.isConnected) {
       throw new Error('Already connected to WinUAE');
     }
@@ -224,6 +227,14 @@ export class WinUAEConnection {
       this.cleanup(true);
       throw err;
     }
+
+    // WinUAE's gdbserver holds a freshly launched machine at its first
+    // instruction until a client attaches, and stays stopped afterwards. A
+    // non-intrusive launch (force_break=false) means "let it run", so release it.
+    if (connectBehavior.forceBreak === false && this.protocol) {
+      trace('Non-intrusive launch: resuming the CPU held at boot');
+      await this.protocol.continue();
+    }
   }
 
   /**
@@ -343,7 +354,7 @@ export class WinUAEConnection {
   async restart(): Promise<string> {
     trace('Restarting with updated configuration...');
     this.cleanup(true);
-    await this.connect();
+    await this.connect(this.lastConnectBehavior);
     return `Restarted WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
   }
 

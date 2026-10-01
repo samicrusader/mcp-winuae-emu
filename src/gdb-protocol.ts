@@ -100,8 +100,13 @@ export class GdbProtocol {
       trace('[GDB] Skipping initial Ctrl+C; connecting in non-intrusive mode.');
     }
 
-    // Allow up to 60s for the first command (boot + hit breakpoint).
-    const supported = await this.sendCommand('qSupported:multiprocess+;swbreak+;hwbreak+', 60000);
+    // The first reply comes once WinUAE's gdbserver has entered its debugger,
+    // which is within a frame or two of boot. 60s used to be allowed here, which
+    // is longer than an MCP client waits for a tool call, so a stuck server
+    // showed up as a client-side timeout instead of this error. The caller
+    // retries the connect, so keep each attempt short (WINUAE_GDB_FIRST_REPLY_MS).
+    const firstReplyMs = parseInt(process.env.WINUAE_GDB_FIRST_REPLY_MS || '15000', 10) || 15000;
+    const supported = await this.sendCommand('qSupported:multiprocess+;swbreak+;hwbreak+', firstReplyMs);
     this.debug(`[GDB] qSupported response: ${supported}`);
 
     // Try to enable no-ack mode for speed (skip if WINUAE_USE_ACK=1; some stubs need acks for M packet)
