@@ -503,10 +503,24 @@ export class GdbProtocol {
     const reply = await this.sendCommand(`qRcmd,${hexCmd}`, timeoutMs);
     if (reply.startsWith('E')) {
       const verb = command.split(/\s+/)[0];
+      // Per-command error codes, where the stub defines them. A bare E01 from a
+      // command not listed here usually means the stub has no such command.
+      const CODES: Record<string, Record<string, string>> = {
+        screenshot: {
+          E01: 'no output path was given',
+          E02: 'screenshot_prepare() failed, so there was no frame to capture',
+          E03: `could not write the PNG; check that the directory exists and is writable`,
+          E04: 'the capture buffer is in a pixel format the stub cannot convert (not 24 or 32bpp)',
+        },
+      };
+      const detail = CODES[verb]?.[reply];
       throw new Error(
-        `Monitor command '${verb}' rejected by the WinUAE GDB stub (${reply}). ` +
-        `The stub answers E01 for commands it does not implement; check that this ` +
-        `WinUAE build is new enough to provide '${verb}'. Full command: ${command}`
+        `Monitor command '${verb}' rejected by the WinUAE GDB stub (${reply})` +
+        (detail
+          ? `: ${detail}.`
+          : `. The stub answers E01 for commands it does not implement; check that this ` +
+            `WinUAE build is new enough to provide '${verb}'.`) +
+        ` Full command: ${command}`
       );
     }
     return reply;

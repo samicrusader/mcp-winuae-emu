@@ -1680,7 +1680,7 @@ const tools: Tool[] = [
   },
   {
     name: 'winuae_screenshot',
-    description: 'Capture the Amiga display to PNG. Default mode tries WinUAE monitor screenshot first and falls back to capturing the visible WinUAE host window if needed.',
+    description: 'Capture the Amiga display to PNG and return it inline. Uses WinUAE\'s own framebuffer grab, which is the clean emulated picture at native size. Does NOT fall back: if the internal grab fails it says so, and you retry with capture_mode: \'host_window\' (a desktop-region grab of the WinUAE window, subject to DPI scaling and occlusion).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1694,9 +1694,19 @@ const tools: Tool[] = [
         },
         capture_mode: {
           type: 'string',
-          enum: ['auto', 'monitor', 'internal', 'host_window'],
-          description: 'auto=try WinUAE internal monitor screenshot first then host window fallback, monitor/internal=only qRcmd internal screenshot, host_window=only capture the visible WinUAE window.',
-          default: 'auto',
+          enum: ['internal', 'monitor', 'auto', 'host_window'],
+          description: "internal (default; monitor and auto are aliases)=WinUAE's own framebuffer grab, no fallback. host_window=grab the visible WinUAE window off the desktop; only use this after an internal capture has failed.",
+          default: 'internal',
+        },
+        alpha: {
+          type: 'boolean',
+          description: 'Internal capture only. Keep the genlock key as a PNG alpha channel instead of discarding it; keyed (video) areas become transparent. Only meaningful when genlock_alpha is set, and off by default since a transparent PNG is harder to read.',
+          default: false,
+        },
+        inline: {
+          type: 'boolean',
+          description: 'Return the PNG directly as an inline image in the tool result (default true). Set false to get only the file path/metadata.',
+          default: true,
         },
       },
     },
@@ -1736,7 +1746,7 @@ const tools: Tool[] = [
 
 // ─── Tool Implementations ────────────────────────────────────────────
 
-async function handleToolCall(name: string, args: any): Promise<{ content: Array<{ type: string; text?: string }> }> {
+async function handleToolCall(name: string, args: any): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; isError?: boolean }> {
   try {
     const normalizedArgs = (args ?? {}) as Record<string, unknown>;
 
@@ -2926,59 +2936,72 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
         const filename = args.filename ?? args.filepath ?? `winuae-screen-${timestamp}.png`;
         const filepath = path.isAbsolute(filename) ? resolve(filename) : path.join(os.tmpdir(), filename);
-        const captureMode = String(args.capture_mode ?? 'auto');
+        const captureMode = String(args.capture_mode ?? 'internal');
         const protocol = connection.getProtocol();
+        const inlineImage = args.inline !== false;
+        const withImage = (text: string) => {
+          const content: any[] = [{ type: 'text', text }];
+          if (inlineImage) {
+            try {
+              content.push({ type: 'image', data: fs.readFileSync(filepath).toString('base64'), mimeType: 'image/png' });
+            } catch (e) {
+              content[0].text += `\n(inline image unavailable: ${e instanceof Error ? e.message : String(e)})`;
+            }
+          }
+          return { content };
+        };
         const sessionInfo = connection.getSessionInfo();
-        let monitorError: string | null = null;
         const screenshotTimeoutMs = Math.max(
           5000,
           parseInt(process.env.WINUAE_SCREENSHOT_TIMEOUT_MS || '30000', 10) || 30000
         );
 
-        const internalOnly = captureMode === 'monitor' || captureMode === 'internal';
         if (captureMode !== 'host_window') {
           try {
             const winPath = filepath.replace(/\//g, '\\');
-            const hexReply = await protocol.sendMonitorCommand(`screenshot ${winPath}`, screenshotTimeoutMs);
+            // 'alpha' keyword keeps the genlock key channel (gdbserver screenshot cmd).
+            const cmd = `screenshot ${args.alpha === true ? 'alpha ' : ''}${winPath}`;
+            const hexReply = await protocol.sendMonitorCommand(cmd, screenshotTimeoutMs);
             const textReply = Buffer.from(hexReply, 'hex').toString('utf8');
             const sizeMatch = textReply.match(/OK\s+(\d+)x(\d+)/i);
+            return withImage(JSON.stringify({
+              file: filepath,
+              capture_mode: 'internal_buffer',
+              alpha: args.alpha === true,
+              width: sizeMatch ? Number.parseInt(sizeMatch[1], 10) : null,
+              height: sizeMatch ? Number.parseInt(sizeMatch[2], 10) : null,
+              reply: textReply,
+            }, null, 2));
+          } catch (error) {
+            // No silent fallback: a host-window grab is a different picture (DPI
+            // scaled, croppable, occludable), so the caller decides to accept it.
+            const message = error instanceof Error ? error.message : String(error);
             return {
+              isError: true,
               content: [{
                 type: 'text',
                 text: JSON.stringify({
-                  file: filepath,
-                  capture_mode: 'internal_buffer',
-                  width: sizeMatch ? Number.parseInt(sizeMatch[1], 10) : null,
-                  height: sizeMatch ? Number.parseInt(sizeMatch[2], 10) : null,
-                  reply: textReply,
+                  error: 'internal_capture_failed',
+                  capture_mode: captureMode,
+                  monitor_error: message,
+                  next_step: "Retry winuae_screenshot with capture_mode: 'host_window' to grab the visible WinUAE window instead. That capture follows the host desktop, so it is affected by display scaling and by anything covering the window.",
                 }, null, 2),
               }],
             };
-          } catch (error) {
-            monitorError = error instanceof Error ? error.message : String(error);
-            if (internalOnly) {
-              throw error;
-            }
           }
         }
 
         const windowCapture = captureWinUAEWindow(filepath, sessionInfo.trackedProcessId ?? undefined);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              file: filepath,
-              capture_mode: 'host_window',
-              monitor_error: monitorError,
-              process_id: windowCapture.processId,
-              method: windowCapture.method,
-              width: windowCapture.width,
-              height: windowCapture.height,
-              title: windowCapture.title,
-              capture_region: windowCapture.captureRegion,
-            }, null, 2),
-          }],
-        };
+        return withImage(JSON.stringify({
+          file: filepath,
+          capture_mode: 'host_window',
+          process_id: windowCapture.processId,
+          method: windowCapture.method,
+          width: windowCapture.width,
+          height: windowCapture.height,
+          title: windowCapture.title,
+          capture_region: windowCapture.captureRegion,
+        }, null, 2));
       }
 
       case 'winuae_disassemble_full': {
