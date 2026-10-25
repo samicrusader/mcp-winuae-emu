@@ -1,10 +1,10 @@
 /**
  * WinUAE connection management and launcher
- * Connects to BartmanAbyss WinUAE fork with GDB RSP server
+ * Launches WinUAE with its built-in GDB server and attaches to it
  *
  * Launch shape:
  *   1. -f <config> when the caller named one, otherwise WinUAE's own default
- *   2. -G to suppress the settings panel (use_gui=no in a config does NOT work)
+ *   2. -s use_gui=no to skip the settings panel
  *   3. -s debugging_features=gdbserver
  * The GDB server listens on port 2345 by default.
  *
@@ -97,17 +97,17 @@ export class WinUAEConnection {
       throw new Error('Already connected to WinUAE');
     }
 
-    // Default: winuae-gdb.exe (32-bit, built by WinUAE-DBG). x64 outputs winuae-gdb-x64.exe
-    let exeName = (process.env.WINUAE_EXE || 'winuae-gdb.exe').trim();
+    // Default: winuae.exe (32-bit, built by WinUAE-DBG). x64 outputs winuae-x64.exe
+    let exeName = (process.env.WINUAE_EXE || 'winuae.exe').trim();
     let exePath = path.join(this.config.winuaePath, exeName);
     trace(`connect: exe=${exeName} path=${exePath} exists=${fs.existsSync(exePath)}`);
 
     if (!fs.existsSync(exePath)) {
-      const fallback = path.join(this.config.winuaePath, 'winuae-gdb-x86.exe');
+      const fallback = path.join(this.config.winuaePath, 'winuae-x86.exe');
       trace(`Primary not found, trying fallback: ${fallback} exists=${fs.existsSync(fallback)}`);
       if (fs.existsSync(fallback)) {
         exePath = fallback;
-        exeName = 'winuae-gdb-x86.exe';
+        exeName = 'winuae-x86.exe';
       } else {
         throw new Error(
           `${exeName} not found at ${exePath}. ` +
@@ -157,11 +157,12 @@ export class WinUAEConnection {
     // style. Commit f6eb535 moved them inside `if (legacyLaunch)`, which left the
     // default path launching with no switches at all: WinUAE then opened its
     // settings panel and never started a GDB server.
-    args.push('-G');
+    // -G was a Barto-era switch; upstream WinUAE does not know it.
     if (!headless) {
       args.push('-s', 'headless=no');
     }
     args.push('-s', 'debugging_features=gdbserver');
+    args.push('-s', `gdb_port=${this.config.gdbPort}`);
     // A config saved with use_gui=yes still opens the settings panel on boot.
     args.push('-s', 'use_gui=no');
     // win32.inactive_input makes WinUAE consume keystrokes while its window is
@@ -228,13 +229,8 @@ export class WinUAEConnection {
       throw err;
     }
 
-    // WinUAE's gdbserver holds a freshly launched machine at its first
-    // instruction until a client attaches, and stays stopped afterwards. A
-    // non-intrusive launch (force_break=false) means "let it run", so release it.
-    if (connectBehavior.forceBreak === false && this.protocol) {
-      trace('Non-intrusive launch: resuming the CPU held at boot');
-      await this.protocol.continue();
-    }
+    // The server halts the CPU when a client attaches; GdbProtocol.connect()
+    // resumes it unless initializeStopped (default: forceBreak) asked to hold it.
   }
 
   /**

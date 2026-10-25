@@ -1,6 +1,8 @@
 # mcp-winuae-emu
 
-An [MCP](https://modelcontextprotocol.io/) server that provides Amiga 68k debugging and development tools through the WinUAE emulator. It connects to a [custom WinUAE fork](https://github.com/axewater/WinUAE/tree/gdb-write-commands) or WinUAE-DBG via GDB Remote Serial Protocol (RSP), giving AI assistants direct read-write access to the emulated Amiga hardware.
+An [MCP](https://modelcontextprotocol.io/) server that provides Amiga 68k debugging and development tools through the WinUAE emulator. It connects to WinUAE's built-in GDB server (`gdb_server.cpp` / `gdb_monitor.cpp`, enabled with `debugging_features=gdbserver`) via GDB Remote Serial Protocol (RSP), giving AI assistants direct read-write access to the emulated Amiga hardware.
+
+> **Server dialect.** This branch speaks the monitor dialect of upstream WinUAE's GDB server (JSON replies, hex arguments; see `capabilities`). It no longer targets Bartman's/axewater's `barto_gdbserver` or WinUAE-DBG: `protect`, `rewind`, `side_read`, `debugperiph`, `train` and `profile` were removed because that server has no equivalent. Reads, writes and monitor queries that need a halted CPU are wrapped in interrupt/retry/resume automatically.
 
 ## What it does
 
@@ -8,7 +10,7 @@ This server lets an AI assistant (Claude, Cursor, etc.) help develop Amiga softw
 
 - **Launching and debugging**: Load executables, set breakpoints, single-step, read/write memory and registers
 - **Capturing output**: Screenshot the emulator display, full m68k disassembly
-- **Simulating input**: Inject keyboard events (raw scancodes or WinUAE event IDs)
+- **Simulating input**: Inject keyboard, mouse and joystick events
 - **Disk management**: Insert/eject floppy images, load binaries into memory
 - **Hardware inspection**: Custom chip registers, Copper list disassembly
 - **Structured snapshots**: One-shot JSON capture of CPU/custom state plus bounded RAM windows
@@ -100,8 +102,9 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_disconnect` | Disconnect from GDB and optionally leave the emulator process running (`stop_emulator=false`) |
 | `winuae_status` | Return JSON session status, health, tracked floppies, reusable-session policy, and tracked PID when this MCP launched WinUAE |
 | `winuae_session_config` | Configure reusable-session idle timeout and whether idle expiry detaches or shuts WinUAE down |
-| `winuae_memory_map` | Return the current memory-bank map parsed from `monitor memcfg` (Chip/Bogo/Fast/Z3 Fast) |
-| `winuae_qoffsets` | Return `qOffsets` relocation info for the current AmigaDOS program when the stub provides it |
+| `winuae_memory_map` | Return the current memory map from `monitor memory-map` (address, size, ram/rom/io, chip) |
+| `winuae_qoffsets` | Return the LoadSeg segments of the current (or a given) AmigaDOS process from `monitor segments`; `text` = first segment, what qOffsets used to report |
+| `winuae_monitor` | Send any monitor command and get its decoded reply (`capabilities`, `tasks`, `exception`, `guest-output`, `checkpoint`, `condition`, `dma-watch`, ...) |
 
 ### Memory
 
@@ -132,19 +135,16 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_breakpoint_conditional_wait` | Software-assisted conditional breakpoint helper that evaluates register/custom/memory predicates on each stop until one matches. |
 | `winuae_watchpoint_set` | Break on memory read/write/access |
 | `winuae_watchpoint_clear` | Remove a watchpoint |
-| `winuae_watchpoint_set_ext` | **WinUAE-DBG v2.1**: watchpoint with predicates and source filter (`src=cpu|copper|blitter|dma`, `value`, `mask`, `must_change`, `reg`, `pc`, `nobreak`). Uses WinUAE memwatch. |
-| `winuae_watchpoint_list` | **v2.1**: list active watchpoints and protects |
-| `winuae_watchpoint_last` | **v2.1**: details of the last watchpoint hit (addr, r/w, size, source, value, PC) |
-| `winuae_watchpoint_clear_ext` | **v2.1**: clear one watchpoint by index or all (`all=true`) |
-| `winuae_emulator_status` | **v2.1**: emulator telemetry (cycles, frame, vpos/hpos, warp, baseText, bp/wp/protect counts, rewind state) |
-| `winuae_protect` | **v2.1**: memory protect/cheat — `block` writes to an address or `set` a forced value (acts on accesses from the emulated program while running) |
-| `winuae_rewind` | **v2.1**: rewind control — `start`/`stop`/`status` manage state capture; with no command, rewinds one frame (restore no longer crashes; GDB session may become unresponsive after a restore) |
-| `winuae_trace` | **v2.1**: control the trace system (`on`/`off`/`status`); logs watch/protect/rewind events to `%TEMP%\winuae-gdb.log` |
-| `winuae_side_read` | **v2.1**: read the WinUAE side channel (port 2346, independent of GDB): `state` / `regs` / `mem <addr> <len>` / `runstatus <addr>`. Useful when GDB is unavailable/inert (e.g. after a rewind restore) to inspect a restored snapshot |
-| `winuae_debugperiph` | **v2.1**: query/control the debug peripheral at `0xB70000` (console, cycle counter, debug args, checkpoints, section bases) — the emulated program self-instruments there; `arg <n> <value>` sets a debug arg |
-| `winuae_base` | **v2.2**: query/set runtime section bases (`text`/`data`/`bss`) for symbol resolution (`monitor base`) — e9k-style |
-| `winuae_train` | **v2.2**: break when a write changes a value `from→to` at ANY address + ignore list (`monitor train`) — e9k-style |
-| `winuae_print` | **v2.2**: print a value from emulated memory (`monitor print`); with `mapPath` resolves a symbol and **simple struct fields via DWARF** of the `.elf` (e.g. `g_game.m_scene.m_scroll_x`, arrays `[N]`, deref). Offline resolution verified by `scripts/verify-dwarf.mjs` |
+| `winuae_watchpoint_set_ext` | Watchpoint with source filter and value predicates (`monitor watch add` / `watch range`): exact 8/16/32-bit access or a byte range, `source` (cpu/copper/blitter/dma/bpl/spr/audio/disk...), `value`, `mask`, `must_change`, `nobreak` |
+| `winuae_watchpoint_list` | List those watchpoints with their ids (`monitor watch list`) |
+| `winuae_watchpoint_last` | Last watchpoint hit from the server's 64-entry event log; `all`/`clear` for the whole log |
+| `winuae_watchpoint_clear_ext` | Remove one watchpoint by id or all (`all=true`) |
+| `winuae_emulator_status` | Execution state, frame, vpos/hpos, cycles, warp, display resolution (works while running) |
+| `winuae_trace` | Instruction history (`monitor history on/off/read`): last N executed instructions with registers |
+| `winuae_base` | Runtime segment bases of the current process (`monitor segments`), read-only |
+| `winuae_findproc` | List Exec tasks (`monitor tasks`); with `name`, the matching process and its segments |
+| `winuae_process_break` | One-shot breakpoint at a program's entry point once it is loaded (`monitor process-break`) |
+| `winuae_print` | Print a value from emulated memory (read client-side); with `mapPath` resolves a symbol and **simple struct fields via DWARF** of the `.elf` (e.g. `g_game.m_scene.m_scroll_x`, arrays `[N]`, deref). Offline resolution verified by `scripts/verify-dwarf.mjs` |
 
 ### Amiga Hardware (core tools)
 
@@ -166,40 +166,41 @@ The server reads your config, merges in GDB-required settings, and launches `win
 
 | Tool | Description |
 |---|---|
-| `winuae_screenshot` | Capture display to PNG. `capture_mode=monitor` or `capture_mode=internal` captures from WinUAE internal framebuffer path (qRcmd screenshot). `capture_mode=auto` only falls back to visible host window if internal capture fails. |
+| `winuae_screenshot` | Capture display to PNG from WinUAE's frame buffer (`monitor screenshot`), scaled to display aspect from `capabilities.display` (`aspect=false` for the raw buffer); genlock key kept as alpha only with `alpha=true`. `capture_mode=host_window` grabs the visible window instead. |
 | `winuae_run_program` | Load binary into memory, set PC, and start execution. For testing executables. |
 | `winuae_exec_chunk` | Write hex-encoded machine code at `address`, set PC (and optional SP/A7), optionally `continue_after`. |
-| `winuae_profile` | Run frame profiler for N frames; writes binary with CPU samples, DMA per scanline (CRT/blitter), custom regs, screenshots. Same format as [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame/Graphics profiler. |
 | `winuae_profile_ollama` | **Canal lateral (2346) + Ollama local**: captura un perfil sin tocar GDB, extrae frames + resumen técnico y devuelve un informe markdown (pre-análisis técnico + descripción de visión) usando SOLO el modelo local. Útil para que la IA verifique si lo que se renderiza encaja con lo pretendido (p.ej. tiles de un scroll montándose bien). No gasta tokens de nube. |
 | `winuae_input_key` | Simulate Amiga keyboard: raw scancode press/release (e.g. 0x45=Return). |
-| `winuae_input_event` | Send raw WinUAE input event (event ID from config). Precise control. |
+| `winuae_input_event` | Send one raw guest input event (`monitor input event <kind> <port> <code> <value>`): keyboard, mouse axis or port control |
 | `winuae_amiga_input_state` | Read and decode Cursor-Amiga-C `g_automation_input` from Amiga memory. |
 | `winuae_amiga_input_set` | Drive Cursor-Amiga-C via its software automation buffer with mouse coordinates, buttons, key slot, and joystick flags. |
 | `winuae_amiga_enter_demo` | Set `g_automation_enter_demo=1` inside Cursor-Amiga-C to enter the demo/effect path. |
 
 ## How it works
 
-1. **Launch**: Reads your `.uae` config, merges GDB settings, spawns `winuae-gdb.exe -portable -G -s debugging_features=gdbserver -s debugging_trigger=`
+1. **Launch**: Reads your `.uae` config, merges GDB settings, spawns `winuae.exe -f <config> -s debugging_features=gdbserver -s gdb_port=<port> -s use_gui=no`. The server halts the CPU when a client attaches; the MCP resumes it unless `initialize_stopped` is set
 2. **Connect**: Retries TCP connection to `localhost:2345` until the GDB server is ready
 3. **Protocol**: Communicates via [GDB RSP](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Protocol.html) -- packet framing, checksums, ack mode, register/memory commands, breakpoint commands, etc.
 
 ### GDB monitor commands (qRcmd)
 
-When using WinUAE-DBG or Bartman fork with monitor support, the MCP server can send extended commands via `qRcmd`:
+Upstream WinUAE's server answers monitor commands with hex-encoded JSON; numbers in arguments are hex. Commands used by the tools:
 
-| Monitor command | Description |
+| Monitor command | Used by |
 |---|---|
-| `screenshot <path>` | Capture display to PNG file (host path) |
-| `disasm <addr> [count]` | Full m68k disassembly at address |
-| `input key <scancode> <1\|0>` | Simulate Amiga keyboard (scancode 0x00-0x7F, 1=press 0=release) |
-| `input event <event_id> [state]` | Send raw input event (state 1/0/2) |
-| `reset` | Restore savestate at process entry (when debugging_trigger set) |
-| `profile <n> <unwind> <out>` | Frame profiler: N frames, optional unwind table, output file. Produces same data as vscode-amiga-debug (DMA per scanline, blitter, CRT flow, screenshots). |
-| `memcfg` | Dump the current memory-bank map so tools can confirm where Chip/Bogo/Fast RAM are actually mapped before direct loads |
+| `capabilities` | screenshot (display resolution), `winuae_emulator_status` |
+| `execution-status`, `warp [on\|off]` | `winuae_emulator_status`, `winuae_warp` (both work while running) |
+| `memory-map` | `winuae_memory_map` |
+| `segments [process]`, `tasks`, `process-break ...` | `winuae_qoffsets`, `winuae_base`, `winuae_print`, `winuae_findproc`, `winuae_process_break` |
+| `watch add\|range\|list\|remove\|last\|events` | `winuae_watchpoint_*_ext` |
+| `history on\|off\|read <n>` | `winuae_trace` |
+| `screenshot <path>`, `disasm <addr> <count>` | `winuae_screenshot`, `winuae_disassemble_full`, postmortem |
+| `floppy insert <n> <path>`, `floppy eject <n>` | `winuae_insert_disk`, `winuae_eject_disk` |
+| `input event <kind> <port> <code> <value>` | `winuae_input_key`, `_event`, `_joy`, `_mouse` |
 
 ### Frame profiling
 
-The `winuae_profile` tool runs WinUAE’s monitor command `profile` and writes a binary file that contains the same exhaustive data as the [vscode-amiga-debug](https://github.com/dvdjg/vscode-amiga-debug) Frame Profiler and Graphics Debugger: CPU samples, DMA records per scanline (CRT beam position, blitter, bitplanes, sprites), custom chip registers, AGA colors, blitter resources, and a screenshot per frame. You can open the file in the extension’s profiler UI or parse it for autonomous analysis (e.g. from an MCP client).
+Removed: upstream WinUAE's GDB server has no `profile` command. `winuae_profile_ollama` below needs the WinUAE-DBG side channel (port 2346), which upstream WinUAE does not have either.
 
 ### Profile + análisis con Ollama local
 

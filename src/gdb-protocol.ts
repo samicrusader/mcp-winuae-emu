@@ -1,6 +1,16 @@
 /**
- * GDB Remote Serial Protocol (RSP) client for BartmanAbyss WinUAE fork
- * Handles packet framing, checksum, ack mode, and all m68k debug commands
+ * GDB Remote Serial Protocol (RSP) client for WinUAE's built-in GDB server
+ * (upstream gdb_server.cpp / gdb_protocol.cpp / gdb_monitor.cpp).
+ * Handles packet framing, checksum, ack mode, and all m68k debug commands.
+ *
+ * Server behaviour this client relies on:
+ * - Attaching halts the CPU. The client resumes it unless the caller asked to
+ *   start stopped.
+ * - Memory, register and most monitor packets answer E16 while the CPU runs.
+ *   sendHalted() turns that into interrupt, retry, resume, so callers never
+ *   see it.
+ * - Monitor (qRcmd) replies are hex-encoded text, nearly always JSON. An empty
+ *   reply means the command does not exist; E01 means it was rejected.
  */
 
 import { Socket } from 'net';
@@ -124,22 +134,21 @@ export class GdbProtocol {
       this.debug('[GDB] WINUAE_USE_ACK=1: keeping ack mode (may help memory write)');
     }
 
+    // The server halts the CPU when a client attaches (gdb_server_poll() calls
+    // interrupt() on accept), whether or not we sent Ctrl+C. Collect the stop
+    // reply, then let the emulation run again unless the caller wants it held.
+    // qOffsets is not implemented upstream; use the `segments` monitor command.
+    let haltReason = this.pendingStopReply;
+    this.pendingStopReply = null;
+    if (!haltReason) {
+      haltReason = await this.sendCommand('?', firstReplyMs);
+    }
+    this.debug(`[GDB] Halt reason: ${haltReason}`);
     if (initializeStopped) {
-      // Query halt reason only when the target is expected to be stopped.
-      const haltReason = await this.sendCommand('?');
-      this.debug(`[GDB] Halt reason: ${haltReason}`);
-
-      // Send qOffsets to trigger baseText calculation in WinUAE-DBG.
-      // This is essential for breakpoint relocation when debugging user programs
-      // but should be skipped for non-intrusive attaches during boot/disk activity.
-      try {
-        const offsets = await this.sendCommand('qOffsets');
-        this.debug(`[GDB] qOffsets response: ${offsets}`);
-      } catch (e) {
-        this.debug(`[GDB] qOffsets not supported or failed: ${e}`);
-      }
+      this._isRunning = false;
     } else {
-      this.debug('[GDB] Non-intrusive attach: skipping initial halt-reason and qOffsets queries.');
+      this.debug('[GDB] Non-intrusive attach: resuming the CPU the server halted on attach.');
+      await this.continue();
     }
   }
 
@@ -289,6 +298,41 @@ export class GdbProtocol {
     return this.sendCommand(command, timeoutMs);
   }
 
+  /**
+   * Interrupt the CPU and wait for its stop reply, whatever _isRunning says.
+   */
+  private interruptNow(timeoutMs: number = 10000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.packetResolvers.findIndex(r => r.resolve === resolve);
+        if (idx >= 0) this.packetResolvers.splice(idx, 1);
+        reject(new Error('Interrupt timeout: the CPU did not stop'));
+      }, timeoutMs);
+      this.packetResolvers.push({ resolve, reject, timer });
+      if (this.socket && !this.socket.destroyed) {
+        this.socket.write(Buffer.from([0x03]));
+      }
+    });
+  }
+
+  /**
+   * Send a command that the server only serves while the CPU is halted. If it
+   * answers E16 (CPU running), stop the CPU, retry, and resume it afterwards,
+   * so a read or a monitor query never changes whether the guest is running.
+   */
+  private async sendHalted(command: string, timeoutMs: number = 10000): Promise<string> {
+    const reply = await this.sendCommand(command, timeoutMs);
+    if (reply !== 'E16') return reply;
+    this.debug(`[GDB] ${command.slice(0, 20)}: E16, CPU running; halting for the request`);
+    await this.interruptNow();
+    this._isRunning = false;
+    try {
+      return await this.sendCommand(command, timeoutMs);
+    } finally {
+      await this.continue();
+    }
+  }
+
   private socketWrite(data: string): void {
     if (this.socket && !this.socket.destroyed) {
       this.socket.write(data, 'binary');
@@ -375,7 +419,7 @@ export class GdbProtocol {
     const readChunk = async (chunkAddr: number, chunkLength: number): Promise<Buffer> => {
       const timeoutMs = baseTimeoutMs + Math.ceil(chunkLength / 1024) * timeoutPerKbMs;
       trace(`readMemory chunk addr=$${chunkAddr.toString(16)} len=${chunkLength} timeout=${timeoutMs}ms`);
-      const reply = await this.sendCommand(`m${chunkAddr.toString(16)},${chunkLength.toString(16)}`, timeoutMs);
+      const reply = await this.sendHalted(`m${chunkAddr.toString(16)},${chunkLength.toString(16)}`, timeoutMs);
       if (reply.startsWith('E')) {
         throw new Error(`Memory read error at $${chunkAddr.toString(16)}: ${reply}`);
       }
@@ -433,7 +477,7 @@ export class GdbProtocol {
       let reply: string | null = null;
       let lastError: Error | null = null;
       try {
-        reply = await this.sendCommand(mPacket, timeoutMs);
+        reply = await this.sendHalted(mPacket, timeoutMs);
         log(`[RECV] ${reply}`);
       } catch (err) {
         lastError = err as Error;
@@ -488,50 +532,50 @@ export class GdbProtocol {
   // ─── Monitor Commands (qRcmd) ────────────────────────────────────────────
 
   /**
-   * Send a monitor command (qRcmd). Command is hex-encoded in the packet.
+   * Send a monitor command (qRcmd) and return the decoded reply text.
    *
-   * Supported by this fork's stub: status, memcfg, warp, watch, protect, base,
-   * trace, df<n> insert/eject, input key|event|joy|mouse, screenshot, disasm,
-   * profile, reset. Anything else answers E01 - notably debugperiph, train,
-   * rewind and findproc, which only exist in the upstream author\'s private tree.
+   * Upstream's server (gdb_monitor.cpp) answers hex-encoded text, usually JSON,
+   * or a bare OK. `capabilities` lists the commands a build has. Commands the
+   * server only serves while halted are retried around an interrupt.
    *
-   * Returns the raw reply. Most commands hex-encode their text (decode with
-   * Buffer.from(hex, 'hex')); `warp` deliberately replies in plain text.
+   * Errors: an empty reply means the build has no such command; E01 means the
+   * server rejected the arguments or could not do it.
    */
   async sendMonitorCommand(command: string, timeoutMs: number = 60000): Promise<string> {
     const hexCmd = Buffer.from(command, 'utf8').toString('hex');
-    const reply = await this.sendCommand(`qRcmd,${hexCmd}`, timeoutMs);
-    if (reply.startsWith('E')) {
-      const verb = command.split(/\s+/)[0];
-      // Per-command error codes, where the stub defines them. A bare E01 from a
-      // command not listed here usually means the stub has no such command.
-      const CODES: Record<string, Record<string, string>> = {
-        screenshot: {
-          E01: 'no output path was given',
-          E02: 'screenshot_prepare() failed, so there was no frame to capture',
-          E03: `could not write the PNG; check that the directory exists and is writable`,
-          E04: 'the capture buffer is in a pixel format the stub cannot convert (not 24 or 32bpp)',
-        },
-      };
-      const detail = CODES[verb]?.[reply];
+    const reply = await this.sendHalted(`qRcmd,${hexCmd}`, timeoutMs);
+    const verb = command.split(/\s+/)[0];
+    if (reply === '') {
       throw new Error(
-        `Monitor command '${verb}' rejected by the WinUAE GDB stub (${reply})` +
-        (detail
-          ? `: ${detail}.`
-          : `. The stub answers E01 for commands it does not implement; check that this ` +
-            `WinUAE build is new enough to provide '${verb}'.`) +
-        ` Full command: ${command}`
+        `Monitor command '${verb}' is not implemented by this WinUAE build's GDB server ` +
+        `(empty reply). Run the 'capabilities' monitor command to see what it offers. Full command: ${command}`
       );
+    }
+    if (/^E[0-9A-Fa-f]{2}$/.test(reply)) {
+      throw new Error(
+        `Monitor command '${verb}' was rejected by the WinUAE GDB server (${reply}): bad arguments, ` +
+        `or the emulator could not carry it out. Full command: ${command}`
+      );
+    }
+    if (reply === 'OK') return 'OK';
+    if (/^[0-9a-fA-F]*$/.test(reply) && reply.length % 2 === 0) {
+      return Buffer.from(reply, 'hex').toString('utf8');
     }
     return reply;
   }
 
   /**
-   * Query relocation offsets for the currently debugged program.
-   * Typical reply: Text=00000400;Data=00012345;Bss=00023456
+   * Send a monitor command and parse its JSON reply. An OK reply (command done,
+   * nothing to report) comes back as null.
    */
-  async queryOffsets(): Promise<string> {
-    return this.sendCommand('qOffsets', 10000);
+  async sendMonitorJson<T = any>(command: string, timeoutMs: number = 60000): Promise<T | null> {
+    const text = await this.sendMonitorCommand(command, timeoutMs);
+    if (text === 'OK') return null;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error(`Monitor command '${command}' returned text that is not JSON: ${text.slice(0, 200)}`);
+    }
   }
 
   // ─── Breakpoint Commands ────────────────────────────────────────────
