@@ -467,7 +467,7 @@ const tools: Tool[] = [
   // Connection tools
   {
     name: 'winuae_connect',
-    description: 'Launch WinUAE (BartmanAbyss fork) and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH and WINUAE_CONFIG env vars, or pass config_file for a one-off .uae path.',
+    description: 'Launch WinUAE with its built-in GDB server (debugging_features=gdbserver) and connect over GDB RSP. Must be called before any other WinUAE commands. Set WINUAE_PATH and WINUAE_CONFIG env vars, or pass config_file for a one-off .uae path.',
     inputSchema: {
       type: 'object',
       properties: {
