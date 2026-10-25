@@ -14,7 +14,6 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { SessionIdleAction, WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
 import { GdbProtocol, M68kRegisters, WatchpointType } from './gdb-protocol.js';
-import { analyzeProfile, ProfileOllamaRequest } from './profile-ollama.js';
 import {
   buildCpuSnapshot,
   buildCustomRegisterSnapshot,
@@ -85,7 +84,6 @@ const CONNECTION_OPTIONAL_TOOLS = new Set([
   'winuae_load',
   'winuae_insert_disk',
   'winuae_eject_disk',
-  'winuae_profile_ollama',
 ]);
 
 function getBaseConfigForArgs(args: Record<string, unknown>): WinUAEConfig {
@@ -672,67 +670,6 @@ const tools: Tool[] = [
   },
 
 
-  {
-    name: 'winuae_profile_ollama',
-    description: 'Captura un perfil por el CANAL LATERAL (2346, sin tocar GDB), extrae frames + resumen tecnico y lo analiza con Ollama LOCAL (sin tokens de nube). Devuelve un informe markdown con la descripcion fiel de lo que se renderiza (vision) y el pre-analisis tecnico (registros custom, DMA, bitplanes, ciclos). Uso tipico: verificar si lo que se ve encaja con lo que se pretendia crear (p.ej. tiles de un scroll montandose bien). Requiere WinUAE-DBG corriendo con el canal lateral activo y Ollama local en 127.0.0.1:11434.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        num_frames: {
-          type: 'number',
-          description: 'Numero de frames a capturar (1-100, default 4)',
-          default: 4,
-        },
-        out_dir: {
-          type: 'string',
-          description: 'Directorio host donde se deja el .bin, los frames y el informe. Default: temp con timestamp.',
-        },
-        prompt: {
-          type: 'string',
-          description: 'Que se espera ver (intencion del programador), p.ej. "scroll horizontal fino, comprobar que los tiles se ensamblan sin salto de 16px". Se anade al prompt generico.',
-        },
-        prompt_file: {
-          type: 'string',
-          description: 'Ruta a un fichero de prompt personalizado (sustituye al generico).',
-        },
-        model: {
-          type: 'string',
-          description: 'Modelo de vision Ollama (default qwen3-vl:8b-instruct-q8_0)',
-        },
-        text_model: {
-          type: 'string',
-          description: 'Modelo de texto Ollama para el pre-analisis tecnico (default qwen3:8b)',
-        },
-        base: {
-          type: 'string',
-          description: 'URL base de Ollama (default http://127.0.0.1:11434)',
-        },
-        mode: {
-          type: 'string',
-          enum: ['meta', 'frames', 'montage', 'all'],
-          description: 'meta=tecnico sin imagenes; frames=por frame; montage=hoja de contacto; all=meta+montage (default).',
-          default: 'all',
-        },
-        frames: {
-          type: 'string',
-          description: 'Subconjunto de frames a analizar con vision (p.ej. "0,1,2"). Default: todos.',
-        },
-        wait_cmd: {
-          type: 'string',
-          description: 'Comando del canal lateral que se repite hasta que wait_contains aparezca antes de capturar (p.ej. "runstatus 0x<addr>").',
-        },
-        wait_contains: {
-          type: 'string',
-          description: 'Texto que debe aparecer en la respuesta de wait_cmd para empezar a capturar (p.ej. "READY").',
-        },
-        side_port: {
-          type: 'number',
-          description: 'Puerto del canal lateral (default 2346)',
-          default: 2346,
-        },
-      },
-    },
-  },
 
   // Memory tools (core: use these for graphics/audio extraction, search, and hardware toggles)
   {
@@ -2039,30 +1976,6 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         } else {
           return { content: [{ type: 'text', text: `DF${drive}: cleared. Will take effect on next winuae_connect.` }] };
         }
-      }
-
-      case 'winuae_profile_ollama': {
-        const os = await import('os');
-        const req: ProfileOllamaRequest = {
-          numFrames: Math.max(1, Math.min(100, args.num_frames ?? 4)),
-          outDir: args.out_dir ? path.resolve(String(args.out_dir)) : path.join(os.tmpdir(), `winuae-profile-ollama-${Date.now()}`),
-          sidePort: Number(args.side_port ?? 2346),
-          lockOwner: 'mcp-profile-ollama',
-          waitCmd: args.wait_cmd ? String(args.wait_cmd) : undefined,
-          waitContains: args.wait_contains ? String(args.wait_contains) : undefined,
-          waitTimeoutMs: 20000,
-          prompt: args.prompt ? String(args.prompt) : undefined,
-          promptFile: args.prompt_file ? path.resolve(String(args.prompt_file)) : undefined,
-          model: args.model ? String(args.model) : '',
-          textModel: args.text_model ? String(args.text_model) : '',
-          base: args.base ? String(args.base) : '',
-          mode: (['meta', 'frames', 'montage', 'all'] as const).includes(args.mode) ? args.mode : 'all',
-          selectedFrames: args.frames
-            ? String(args.frames).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n))
-            : undefined,
-        };
-        const report = await analyzeProfile(req);
-        return { content: [{ type: 'text', text: report }] };
       }
 
       case 'winuae_memory_read': {

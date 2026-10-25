@@ -169,7 +169,6 @@ The server reads your config, merges in GDB-required settings, and launches `win
 | `winuae_screenshot` | Capture display to PNG from WinUAE's frame buffer (`monitor screenshot`), scaled to display aspect from `capabilities.display` (`aspect=false` for the raw buffer); genlock key kept as alpha only with `alpha=true`. `capture_mode=host_window` grabs the visible window instead. |
 | `winuae_run_program` | Load binary into memory, set PC, and start execution. For testing executables. |
 | `winuae_exec_chunk` | Write hex-encoded machine code at `address`, set PC (and optional SP/A7), optionally `continue_after`. |
-| `winuae_profile_ollama` | **Canal lateral (2346) + Ollama local**: captura un perfil sin tocar GDB, extrae frames + resumen técnico y devuelve un informe markdown (pre-análisis técnico + descripción de visión) usando SOLO el modelo local. Útil para que la IA verifique si lo que se renderiza encaja con lo pretendido (p.ej. tiles de un scroll montándose bien). No gasta tokens de nube. |
 | `winuae_input_key` | Simulate Amiga keyboard: raw scancode press/release (e.g. 0x45=Return). |
 | `winuae_input_event` | Send one raw guest input event (`monitor input event <kind> <port> <code> <value>`): keyboard, mouse axis or port control |
 | `winuae_amiga_input_state` | Read and decode Cursor-Amiga-C `g_automation_input` from Amiga memory. |
@@ -200,19 +199,7 @@ Upstream WinUAE's server answers monitor commands with hex-encoded JSON; numbers
 
 ### Frame profiling
 
-Removed: upstream WinUAE's GDB server has no `profile` command. `winuae_profile_ollama` below needs the WinUAE-DBG side channel (port 2346), which upstream WinUAE does not have either.
-
-### Profile + análisis con Ollama local
-
-`winuae_profile_ollama` hace el bucle completo sin competir por el socket GDB: se captura por el **canal lateral** (2346, con `lock assist`), se parsea el binario (mismo formato que `vscode-amiga-debug`), se extraen los frames y `profile-summary.json`, y se pide a Ollama local un **pre-análisis técnico** (registros custom, DMA, bitplanes, ciclos — modelo de texto) más una **descripción de visión** de la secuencia (hoja de contacto con ffmpeg, o por frame). Todo con tokens del modelo local:
-
-```
-winuae_profile_ollama num_frames=4 prompt="scroll horizontal fino; comprobar que los tiles se ensamblan sin salto de 16px"
-```
-
-Parámetros: `num_frames`, `out_dir`, `prompt`/`prompt_file` (qué se espera ver), `model` (visión, def `qwen3-vl:8b-instruct-q8_0`), `text_model` (def `qwen3:8b`), `base` (def `http://127.0.0.1:11434`), `mode` (`meta|frames|montage|all`), `frames` (subconjunto), `wait_cmd`/`wait_contains` (esperar READY antes de capturar), `side_port` (def 2346).
-
-Requisitos: WinUAE-DBG con el canal lateral activo (lanzar con `WINUAE_GDB_PERSIST_LISTENER=1`) y Ollama local en ejecución. El equivalente en scripts del repo `Amiga-Cpp` es `tools/profile/ai-analyze.mjs` (orquestador que imprime el informe por stdout).
+Removed: upstream WinUAE's GDB server has no `profile` command and no side channel, so `winuae_profile` and `winuae_profile_ollama` are gone.
 
 ### What you can do with the core tools (for the AI)
 
